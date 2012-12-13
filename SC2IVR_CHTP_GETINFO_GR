@@ -1,0 +1,239 @@
+create or replace procedure SC2IVR_CHTP_GETINFO_GR(
+/********************************************************************************
+
+-- matvienko - вывод результатов в XML
+   -- данная процедура - доработка процедуры SC2IVR_CHTP_GETINFO
+-- процедура для определения перечня доступных т.п.
+-- последняя модификация: добавлена переменная p_TESTIVR, необходимая для тестирования на тестовой среде
+-- последняя модификация: добавлена соритровка по дате доступности перехода
+-- посдежгяя модификация: добавлена p_BusSeg
+                          выполняется вывод групп тарифных планов в теге AVAILABLE_GROUPS
+
+********************************************************************************/
+p_MSISDN  IN VARCHAR2,
+p_OLD_COS IN VARCHAR2,
+p_NEW_COS IN VARCHAR2,
+p_IVRType IN NUMBER,
+      -- 0 Об.смена т.п. IVRAllow=0и4,
+      -- 2 - Миграция IVRAllow=2,
+      -- 3 - Региональная смена т.п. IVRAllowed=3
+p_TESTIVR  in NUMBER DEFAULT 0,
+p_BusSeg in NUMBER DEFAULT 0,
+         -- Бизнес сегмент абоеннта - идентичен valera.dir_segments
+--p_OLD_HOME1 IN VARCHAR2,
+--p_OLD_HOME2 IN VARCHAR2,
+--p_OLD_HOME3 IN VARCHAR2,
+--p_OLD_HOME4 IN VARCHAR2,
+p_Current_Name  OUT VARCHAR2,
+p_Main_Select_File OUT VARCHAR2,
+p_Main_Count OUT NUMBER,
+p_res OUT NUMBER,
+      -- код результата работы процедуры
+p_XML OUT CLOB
+      -- рузультат в XML
+) is
+       v_count NUMBER;
+       v_avail_groups XMLType; -- результат для доступных групп ТП
+       v_group1 XMLType; -- результат для одной строки с группой ТП
+       v_result1 XMLType; -- результат для одной строки с ТП
+       v_result XMLType; -- общий результат процедуры
+       v_GroupCounter NUMBER; -- счетчик ID текущей группы в цикле формирования XML с группами
+       v_root VARCHAR(32);
+       v_tst_date_minus INTEGER(2);
+
+BEGIN
+
+-- инициализация переменных
+v_count := 0;
+v_GroupCounter := 0;
+v_tst_date_minus := 50; -- кол-во дней, которое отнимаем для тестирования
+--- инициализация параметров
+p_Main_Count:=0;
+p_Main_Select_File:='';
+
+FOR c_cur IN (
+SELECT chtp.rp_id_new,
+       chtp.billing_name_new,
+       chtp.filename_plan,
+       chtp.filename_info,
+       chtp.add_inf,
+       chtp.rpchange_id,
+       chtp.ivr_allowed,
+       -- поля для группировки ТП
+       g.group_id, g.group_name, g.group_filename,
+       p2g.business_seg
+FROM (
+SELECT t.rp_id_new,
+       t.billing_name_new,
+       pn.filename_plan,
+       pn.filename_info ||
+          (CASE
+             WHEN pp.value IS NOT NULL
+             THEN DECODE(pp.param,
+                         'MINVOL', ';ksiTar164Menu1',
+                         'BONUS', ';ksiAboutBonusMin_press1',
+                         'OVERVOL', ';ksi_OverVol_Menu',
+                         '')
+             ELSE '' END) AS filename_info,
+       NVL(pp.value,'') add_inf,
+       t.rpchange_id,
+       t.ivr_allowed
+   FROM selfcare.sc_rate_plan p,
+        ivr.sc2ivr_plan_name pn,
+        selfcare.sc_rate_plan_change t
+        LEFT JOIN ivr.sc2ivr_plan_param  pp
+             ON pp.rp_id=t.rp_id_new
+             AND (pp.param = 'MINVOL' OR pp.param = 'BONUS' OR pp.param = 'OVERVOL')
+
+   WHERE UPPER(p.billing_name)=UPPER(p_OLD_COS)
+         AND t.rp_id_old=p.rp_id
+         AND (
+             (p_NEW_COS IS NOT NULL and UPPER(t.rp_id_new) IN (UPPER(p_NEW_COS)))
+             OR p_NEW_COS IS NULL
+             )
+         /*AND NVL(p.home1,0)=NVL(p_OLD_HOME1,0) Demchenko
+         AND NVL(p.home2,0)=NVL(p_OLD_HOME2,0)
+         AND NVL(p.home3,0)=NVL(p_OLD_HOME3,0)
+         AND NVL(p.home4,0)=NVL(p_OLD_HOME4,0)*/
+         AND sysdate BETWEEN decode(p_TESTIVR, 1, t.date_from-v_tst_date_minus, t.date_from)
+         AND t.date_to
+         AND ((
+             (p_IVRType=0 AND t.ivr_allowed IN (0,4) ) 
+             OR t.ivr_allowed=p_IVRType)
+         --Добавлено значение ivrallowed=5, которое позволяет отображать переход как в обычном 477, так и в региональных меню 929 и 9595
+             OR (p_IVRType not in (2,4) AND t.ivr_allowed=5))
+         AND t.rp_id_new=pn.sc_rpid
+         -- не выбираем ТП без этой информации
+         AND pn.filename_info IS NOT NULL
+         AND pn.filename_plan IS NOT NULL
+
+         -- matvienko 06.03.2012
+         -- проверка маски сегмента перехода
+         AND IVR.IS_MASK_ALLOWED(p_BusSeg, t.ivr_segment)=1
+
+   ORDER BY t.date_from DESC
+   ) chtp
+   LEFT JOIN
+             (
+               ivr.sc2ivr_plan2group p2g
+               INNER JOIN ivr.sc2ivr_plan_groups g
+                     ON g.group_id=p2g.group_id
+                     AND p2g.business_seg = p_BusSeg
+             )
+
+        ON chtp.rp_id_new = p2g.sc_rpid
+
+        ORDER BY g.group_id ASC
+)
+LOOP
+v_count := 1;
+IF c_cur.ivr_allowed=4 then
+  SELECT COUNT(*) INTO v_count
+         FROM  ivr.sc2ivr_chtp_registry tr, ivr.ivr_registry_table_info i, ivr.ivr_registry_table_part r
+         WHERE r.c_comment=i.c_comment
+               AND i.id=tr.registry_id
+               AND r.msisdn=p_MSISDN
+               AND tr.rpchange_id=c_cur.rpchange_id
+               AND sysdate between decode(p_TESTIVR,1,i.date_start-v_tst_date_minus,i.date_start) and i.date_end_info;
+END IF;
+
+  IF v_count!=0 THEN
+      p_Main_Count:=p_Main_Count+1;
+      p_Main_Select_File:= p_Main_Select_File ||
+                           c_cur.filename_plan ||
+                           ';HI_Enter;?' ||
+                           to_char(p_Main_Count) ||
+                           ';';
+
+--- элемент структуры с детализацией тарифного плана
+        SELECT XMLElement("TP",
+                     -- добавляем атрибут группы, в которую входит ТП
+                     XMLAttributes(c_cur.group_id as "GROUP_ID"),
+                     -- XMLFOREST не создает элементы с пустыми значениями, нужно это учитывать в обработке результатов
+                     XMLForest(
+                           c_cur.billing_name_new as COS,
+                           c_cur.filename_plan as PLAN_NAME,
+                           c_cur.filename_info as PLAN_INFO,
+                           c_cur.add_inf as PLAN_INFO_2))
+               INTO v_result1
+               FROM DUAL;
+
+--- объединение текущего элемента со сформированной общей структурой результата
+        SELECT XMLConcat(v_result,v_result1) AS "result"
+               INTO v_result
+               FROM DUAL;
+
+--- Элемент xml group
+    IF v_GroupCounter < c_cur.group_id THEN
+        SELECT XMLElement("GROUP",
+               XMLForest(
+                        c_cur.group_id as ID,
+                        c_cur.group_name as NAME,
+                        c_cur.group_filename as FILENAME
+                        )
+               )
+               INTO v_group1
+               FROM DUAL;
+
+         SELECT XMLConcat(v_avail_groups, v_group1) AS "result"
+                INTO v_avail_groups
+                FROM DUAL;
+
+     v_GroupCounter := c_cur.group_id;
+     END IF;
+
+  END IF;
+
+END LOOP;
+
+--- Рутовый элемент AVAILABLE_GROUPS
+v_root := 'AVAILABLE_GROUPS';
+SELECT XMLElement(evalname v_root, v_avail_groups) as "RESULT" INTO v_avail_groups FROM DUAL;
+
+--- склеиваем AVAILABLE_GROUPS с набором тегов TP (v_result)
+        SELECT XMLConcat(v_avail_groups,v_result) AS "result"
+               INTO v_result
+               FROM DUAL;
+
+--- формируем рутовый элемент документа
+v_root := 'IVR_TPS';
+SELECT XMLElement(evalname v_root, v_result) as "RESULT" INTO v_result FROM DUAL;
+
+-- передаем результат в исходящий параметр
+p_XML:=v_result.getClobVal();
+
+SELECT pn.filename_plan
+       INTO p_Current_Name
+       FROM selfcare.sc_rate_plan t,  ivr.sc2ivr_plan_name pn
+       WHERE UPPER(t.billing_name)=UPPER(p_OLD_COS)
+             AND t.rp_id=pn.sc_rpid
+            /* AND NVL(t.home1,0)=NVL(p_OLD_HOME1,0)
+             AND NVL(t.home2,0)=NVL(p_OLD_HOME2,0)
+             AND NVL(t.home3,0)=NVL(p_OLD_HOME3,0)
+             AND NVL(t.home4,0)=NVL(p_OLD_HOME4,0)*/;
+
+p_Main_Select_File:='cmsAccessiblePlans;' || p_Main_Select_File;
+
+-- выбираем кол-во уникальных COS из XML: matvienko
+SELECT COUNT(DISTINCT COS) INTO p_Main_Count
+FROM   XMLTable('for $i in /IVR_TPS/TP
+                            return $i'
+                            passing   v_result
+                            columns   COS varchar2(50) path 'COS'
+               );
+
+IF p_Main_Count>9 THEN
+   p_Main_Select_File:='HI_PressDashAfterChoice;' || p_Main_Select_File;
+END IF;
+
+IF  p_Main_Count=0 THEN
+    p_res:=100000002;--No available TP change
+    ELSE
+    p_res:=0;
+END IF;
+
+EXCEPTION
+WHEN NO_DATA_FOUND THEN
+     p_res:=100000001; --NOTFOUND
+
+end;
